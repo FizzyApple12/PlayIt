@@ -29,6 +29,7 @@ impl From<i32> for IPCCommand {
     fn from(v: i32) -> IPCCommand {
         match v {
             x if x == IPCCommand::Play as i32 => IPCCommand::Play,
+            x if x == IPCCommand::Goodbye as i32 => IPCCommand::Goodbye,
             x if x == IPCCommand::Pause as i32 => IPCCommand::Pause,
             x if x == IPCCommand::Status as i32 => IPCCommand::Status,
             x if x == IPCCommand::SongMeta as i32 => IPCCommand::SongMeta,
@@ -78,9 +79,7 @@ is in use by another process and try again."
                                 let _ = sender.write_all(b"0");
                             }
                             IPCCommand::Goodbye => {
-                                let _ = sender.write_all(b"0");
-
-                                return;
+                                break;
                             }
                             other_command => {
                                 ipc_handler(other_command, args);
@@ -91,11 +90,9 @@ is in use by another process and try again."
                         Err(e) => {
                             eprintln!("Error while handling connection: {e}");
 
-                            let _ = sender.write_all(b"0");
-
-                            return;
+                            break;
                         }
-                    }
+                    };
                 }
             });
         }
@@ -122,8 +119,8 @@ async fn parse_next(receiver: &mut BufReader<&Stream>) -> io::Result<(IPCCommand
             let command_type = command_number.into();
 
             match command_type {
-                IPCCommand::None => return Ok((IPCCommand::None, command_buffer)),
-                IPCCommand::Goodbye => return Ok((IPCCommand::Goodbye, command_buffer)),
+                IPCCommand::None => {}  // No Args,
+                IPCCommand::Goodbye => {}  // No Args,
                 IPCCommand::Play => {
                     let recv = receiver.read_line(&mut buffer); // Song Hash
                     try_join!(recv)?;
