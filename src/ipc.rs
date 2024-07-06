@@ -26,8 +26,8 @@ pub enum IPCCommand {
 }
 
 impl From<i32> for IPCCommand {
-    fn from(v: i32) -> IPCCommand {
-        match v {
+    fn from(value: i32) -> IPCCommand {
+        match value {
             x if x == IPCCommand::Play as i32 => IPCCommand::Play,
             x if x == IPCCommand::Goodbye as i32 => IPCCommand::Goodbye,
             x if x == IPCCommand::Pause as i32 => IPCCommand::Pause,
@@ -39,16 +39,16 @@ impl From<i32> for IPCCommand {
 }
 
 pub async fn start(ipc_handler: fn(IPCCommand, Vec<String>)) -> io::Result<()> {
-    let printname = "playit.sock";
-    let name = printname.to_ns_name::<GenericNamespaced>()?;
+    let socket_name = "playit.sock";
+    let socket_ns_name = socket_name.to_ns_name::<GenericNamespaced>()?;
 
-    let opts = ListenerOptions::new().name(name);
+    let listener_options = ListenerOptions::new().name(socket_ns_name);
 
-    let listener = match opts.create_tokio() {
+    let listener = match listener_options.create_tokio() {
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
             eprintln!(
                 "
-Error: could not start server because the socket file is occupied. Please check if {printname}
+Error: could not start server because the socket file is occupied. Please check if {socket_name}
 is in use by another process and try again."
             );
             return Err(e.into());
@@ -56,7 +56,7 @@ is in use by another process and try again."
         x => x?,
     };
 
-    println!("Server running at {printname}");
+    println!("Server running at {socket_name}");
 
     tokio::spawn(async move {
         loop {
@@ -106,8 +106,8 @@ async fn parse_next(receiver: &mut BufReader<&Stream>) -> io::Result<(IPCCommand
 
     let mut buffer: String = String::new();
 
-    let recv = receiver.read_line(&mut buffer);
-    try_join!(recv)?;
+    let readline = receiver.read_line(&mut buffer);
+    try_join!(readline)?;
 
     if buffer.is_empty() {
         return Ok((IPCCommand::Goodbye, command_buffer));
@@ -119,19 +119,21 @@ async fn parse_next(receiver: &mut BufReader<&Stream>) -> io::Result<(IPCCommand
             let command_type = command_number.into();
 
             match command_type {
-                IPCCommand::None => {}  // No Args,
-                IPCCommand::Goodbye => {}  // No Args,
+                IPCCommand::None => {}    // No Args,
+                IPCCommand::Goodbye => {} // No Args,
                 IPCCommand::Play => {
-                    let recv = receiver.read_line(&mut buffer); // Song Hash
-                    try_join!(recv)?;
+                    // Song Hash
+                    let readline = receiver.read_line(&mut buffer);
+                    try_join!(readline)?;
                     command_buffer.push(buffer.trim_ascii().to_string());
                     buffer.clear();
                 }
                 IPCCommand::Pause => {}  // No Args
                 IPCCommand::Status => {} // No Args
                 IPCCommand::SongMeta => {
-                    let recv = receiver.read_line(&mut buffer); // Song Hash
-                    try_join!(recv)?;
+                    // Song Hash
+                    let readline = receiver.read_line(&mut buffer);
+                    try_join!(readline)?;
                     command_buffer.push(buffer.trim_ascii().to_string());
                     buffer.clear();
                 }
