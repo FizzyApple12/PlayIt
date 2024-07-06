@@ -5,7 +5,7 @@ use interprocess::local_socket::{
 use std::convert::From;
 use std::io;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, BufReader},
     try_join,
 };
 
@@ -38,7 +38,7 @@ impl From<i32> for IPCCommand {
     }
 }
 
-pub async fn start(ipc_handler: fn(IPCCommand, Vec<String>)) -> io::Result<()> {
+pub async fn start(ipc_handler: fn(&Stream, IPCCommand, Vec<String>)) -> io::Result<()> {
     let socket_name = "playit.sock";
     let socket_ns_name = socket_name.to_ns_name::<GenericNamespaced>()?;
 
@@ -51,7 +51,8 @@ pub async fn start(ipc_handler: fn(IPCCommand, Vec<String>)) -> io::Result<()> {
 Error: could not start server because the socket file is occupied. Please check if {socket_name}
 is in use by another process and try again."
             );
-            return Err(e.into());
+
+            return Err(e);
         }
         x => x?,
     };
@@ -70,21 +71,16 @@ is in use by another process and try again."
 
             tokio::spawn(async move {
                 let mut receiver = BufReader::new(&connection);
-                let mut sender = &connection;
 
                 loop {
                     match parse_next(&mut receiver).await {
                         Ok((command_type, args)) => match command_type {
-                            IPCCommand::None => {
-                                let _ = sender.write_all(b"0");
-                            }
+                            IPCCommand::None => {}
                             IPCCommand::Goodbye => {
                                 break;
                             }
                             other_command => {
-                                ipc_handler(other_command, args);
-
-                                let _ = sender.write_all(b"1");
+                                ipc_handler(&connection, other_command, args);
                             }
                         },
                         Err(e) => {
@@ -98,7 +94,7 @@ is in use by another process and try again."
         }
     });
 
-    return Ok(());
+    Ok(())
 }
 
 async fn parse_next(receiver: &mut BufReader<&Stream>) -> io::Result<(IPCCommand, Vec<String>)> {
@@ -139,12 +135,12 @@ async fn parse_next(receiver: &mut BufReader<&Stream>) -> io::Result<(IPCCommand
                 }
             }
 
-            return Ok((command_type, command_buffer));
+            Ok((command_type, command_buffer))
         }
         Err(e) => {
             eprintln!("Unknown IPC Commnd, {e}");
 
-            return Ok((IPCCommand::None, command_buffer));
+            Ok((IPCCommand::None, command_buffer))
         }
-    };
+    }
 }

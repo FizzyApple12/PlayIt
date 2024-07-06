@@ -1,7 +1,7 @@
 pub struct Database {}
 
 pub fn create() -> Database {
-    return Database {};
+    Database {}
 }
 
 impl Database {
