@@ -3,12 +3,7 @@ let
 in
 { pkgs ? import <nixpkgs> {} }:
 pkgs.mkShell {
-    nativeBuildInputs = with pkgs.buildPackages; [ 
-        #unstable.cargo
-        #unstable.rustc
-        #unstable.llvm
-        #unstable.clang
-        #unstable.elf2uf2-rs
+    nativeBuildInputs = with pkgs.buildPackages; [
         unstable.rustup
     ];
     LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
