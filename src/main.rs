@@ -1,3 +1,4 @@
+mod audio;
 mod database;
 mod ipc;
 
@@ -9,7 +10,8 @@ use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = database::create();
+    // let _ = database::create();
+    let audio_system = audio::create();
 
     fn handle_ipc_command(
         mut ipc_stream: &Stream,

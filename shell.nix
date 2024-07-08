@@ -5,6 +5,9 @@ in
 pkgs.mkShell {
     nativeBuildInputs = with pkgs.buildPackages; [
         unstable.rustup
+        unstable.pkg-config
+        unstable.alsa-lib
+        unstable.libjack2
     ];
     LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
 }
