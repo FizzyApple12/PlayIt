@@ -109,10 +109,7 @@ impl AudioPlayback {
     }
 
     fn new_config(&self) -> Option<SupportedStreamConfig> {
-        let device = self
-            .cpal_device
-            .as_ref()
-            .expect("ummm hi, if you see this, all logic has been defied on the first case");
+        let device = self.cpal_device.as_ref()?;
 
         match device.supported_output_configs() {
             Ok(mut supported_configs_range) => supported_configs_range
@@ -127,15 +124,9 @@ impl AudioPlayback {
         audio_receiver: Receiver<f32>,
         error_sender: Sender<StreamError>,
     ) -> Option<Stream> {
-        let config = self
-            .cpal_config
-            .as_ref()
-            .expect("ummm hi, if you see this, all logic has been defied on the second case");
+        let config = self.cpal_config.as_ref()?;
 
-        let device = self
-            .cpal_device
-            .as_ref()
-            .expect("ummm hi, if you see this, all logic has been defied on the third case");
+        let device = self.cpal_device.as_ref()?;
 
         match config.sample_format() {
             SampleFormat::F32 => create_output_stream!(device, config, f32, audio_receiver, error_sender),
