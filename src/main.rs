@@ -25,7 +25,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = ipc::start(handle_ipc_command).await;
 
+    let sample_rate = audio_system.cpal_config.as_ref().expect("msg").config().sample_rate.0 as f32;
+    let channels = audio_system.cpal_config.as_ref().expect("msg").config().channels as usize;
+
+    let mut sample_clock = 0f32;
+    let mut next_sample = move || {
+        sample_clock = (sample_clock + 1.0) % sample_rate;
+        (sample_clock * 440.0 * 2.0 * std::f32::consts::PI / sample_rate).sin()
+    };
+
+    audio_system.play();
+
     loop {
+        for _ in 0..100000 {
+            let sample_data = vec![next_sample()];
+            
+            for _ in 0..channels {
+                audio_system.write_next_samples(&sample_data);
+            }
+        }
+
         thread::sleep(Duration::from_secs(1));
     }
 }
