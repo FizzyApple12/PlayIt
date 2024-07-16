@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let _ = database::create();
-    let audio_system = audio::create();
+    let audio_system = audio::playback::create();
 
     fn handle_ipc_command(
         mut ipc_stream: &Stream,
@@ -25,8 +25,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = ipc::start(handle_ipc_command).await;
 
-    let sample_rate = audio_system.cpal_config.as_ref().expect("msg").config().sample_rate.0 as f32;
-    let channels = audio_system.cpal_config.as_ref().expect("msg").config().channels as usize;
+    let Some(current_config) = audio_system.get_config() else {
+        println!("No config available!");
+
+        return Ok(());
+    };
+
+    let sample_rate = current_config.sample_rate.0 as f32;
+    let channels = current_config.channels as usize;
 
     let mut sample_clock = 0f32;
     let mut next_sample = move || {
