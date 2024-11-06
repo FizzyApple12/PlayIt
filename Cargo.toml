@@ -1,9 +1,9 @@
 [package]
-name = "PlayIt"
+name = "playit"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.38", features = [ "full" ] }
-interprocess = { version = "2.2", features = [ "tokio" ] }
-cpal = { version = "0.15", features = [ "jack" ] }
+playit-engine = { path = "./engine" }
+
+tokio = { version = "1.41", features = ["full"] }

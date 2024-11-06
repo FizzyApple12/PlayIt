@@ -1,0 +1,19 @@
+[package]
+name = "playit-engine"
+version = "0.1.0"
+edition = "2021"
+
+[build]
+rustflags = "-C codegen-units=1"
+
+[dependencies]
+tokio = { version = "1.41", features = ["full"] }
+interprocess = { version = "2.2", features = ["tokio"] }
+cpal = { version = "0.15", features = ["jack"] }
+rodio = "0.19"
+shellexpand = "3.1"
+musicbrainz_rs = "0.5"
+serde = "1.0"
+serde_json = "1.0"
+take_mut = "0.2"
+uuid = { version = "1.11", features = ["v4", "serde"] }
