@@ -61,7 +61,7 @@ impl IPCServer {
 
                 let (receiver, sender) = connection.split();
 
-                let commection_reader = tokio::spawn(async move {
+                let connection_reader = tokio::spawn(async move {
                     let mut receiver = BufReader::new(receiver);
 
                     loop {
@@ -98,7 +98,7 @@ impl IPCServer {
 
                 let mut new_response_receiver = response_sender.subscribe();
 
-                let commection_writer = tokio::spawn(async move {
+                let connection_writer = tokio::spawn(async move {
                     let mut sender = BufWriter::new(sender);
 
                     loop {
@@ -120,8 +120,8 @@ impl IPCServer {
                     }
                 });
 
-                let _ = commection_reader.await;
-                commection_writer.abort();
+                let _ = connection_reader.await;
+                connection_writer.abort();
             }
         });
 

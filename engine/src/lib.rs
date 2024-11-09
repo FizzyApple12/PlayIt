@@ -1,8 +1,7 @@
-use std::time::Duration;
+use std::{io::Read, time::Duration};
 
 use ipc::{client::IPCClient, server::IPCServer};
-use player::{database::Database, PlaylistMetadata, SongMetadata};
-use rodio::{OutputStream, OutputStreamHandle, Sink};
+use player::{database::Database, sequencer::Sequencer, PlaylistMetadata, RecordingMetadata};
 use tokio::{
     sync::{
         broadcast,
@@ -15,9 +14,7 @@ mod ipc;
 mod player;
 
 pub struct Engine {
-    sink: Sink,
-    stream_handle: OutputStreamHandle,
-
+    sequencer: Sequencer,
     database: Database,
 
     location: EngineLocation,
@@ -33,10 +30,10 @@ use uuid::Uuid;
 pub enum LoopMode {
     None,
     LoopQueue,
-    LoopSong,
+    LoopRecording,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde()]
 pub enum Permission {
     Control,
@@ -65,17 +62,17 @@ pub enum EngineCommand {
 
     LoopMode(LoopMode),
 
-    SongMetadata(String),
-    SongFile(String),
-    SendSong((SongMetadata, Vec<u8>)),
+    RecordingMetadata(String),
+    RecordingFile(String),
+    SendRecording((String, Vec<u8>)),
 
-    PlaylistMetadata(Uuid),
-    SetPlaylistMetadata((Uuid, PlaylistMetadata)),
+    PlaylistMetadata(String),
+    SetPlaylistMetadata(PlaylistMetadata),
 
     SetVolume(f32),
 
     GetPermissions,
-    SetPermissions((Uuid, Vec<Permission>)),
+    SetPermissions(Vec<Permission>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -85,7 +82,7 @@ pub enum EngineResponse {
     Nope(EngineCommand),
 
     NowPlaying(String),
-    NowPaused(String),
+    NowPaused,
 
     Seek(Duration),
     CurrentTime(Duration),
@@ -94,8 +91,8 @@ pub enum EngineResponse {
 
     LoopMode(LoopMode),
 
-    SongMetadata(SongMetadata),
-    SongFile((String, Vec<u8>)),
+    RecordingMetadata(RecordingMetadata),
+    RecordingFile((String, Vec<u8>)),
 
     PlaylistMetadata(PlaylistMetadata),
 
@@ -119,8 +116,8 @@ pub enum EngineLocation {
 }
 
 pub enum EngineError {
-    AudioInitializationError,
-    DatabaseInitializationError,
+    AudioInitializationFailed,
+    DatabaseInitializationFailed,
 }
 
 pub enum EngineConnectionStatus {
@@ -156,20 +153,15 @@ impl Engine {
         let (engine_response_sender, engine_response_receiver) =
             broadcast::channel::<EngineResponse>(16);
 
-        let Ok((_stream, stream_handle)) = OutputStream::try_default() else {
-            return Err(EngineError::AudioInitializationError);
+        let Ok(database) = Database::new() else {
+            return Err(EngineError::DatabaseInitializationFailed);
         };
-        let Ok(sink) = Sink::try_new(&stream_handle) else {
-            return Err(EngineError::AudioInitializationError);
-        };
-
-        let Some(database) = Database::new() else {
-            return Err(EngineError::DatabaseInitializationError);
+        let Ok(sequencer) = Sequencer::new(database.clone()) else {
+            return Err(EngineError::AudioInitializationFailed);
         };
 
         let mut new_engine = Engine {
-            sink,
-            stream_handle,
+            sequencer,
             database,
             location: EngineLocation::Invalid,
             engine_command_sender: engine_command_sender.clone(),
@@ -186,13 +178,18 @@ impl Engine {
         mut command_receiver: mpsc::Receiver<(EngineCommand, Uuid)>,
         response_sender: broadcast::Sender<(EngineResponse, Uuid)>,
     ) -> JoinHandle<()> {
-        let mut local_command_receiver = self.engine_command_sender.subscribe();
-        let local_response_sender = self.engine_response_sender.clone();
+        let mut internal_command_receiver = self.engine_command_sender.subscribe();
+        let internal_response_sender = self.engine_response_sender.clone();
+
+        let database = self.database.clone();
+        let sequencer = self.sequencer.clone();
 
         tokio::spawn(async move {
+            let mut current_user_permissions = Vec::<Permission>::new();
+
             loop {
-                let (command, uuid, local) = tokio::select! {
-                    val = local_command_receiver.recv() => {
+                let (command, uuid, internal) = tokio::select! {
+                    val = internal_command_receiver.recv() => {
                         let Ok(command) = val else {
                             continue;
                         };
@@ -211,196 +208,447 @@ impl Engine {
                 match command {
                     EngineCommand::None | EngineCommand::Goodbye => {
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
                             EngineResponse::Ok(command),
                             uuid,
                         );
                     }
-                    EngineCommand::Play(_) => {
-                        // TODO: Start playing the song if there is one, otherwise resume, otherwise "Nope"
-                        route_response(
-                            local,
-                            &local_response_sender,
-                            &response_sender,
-                            EngineResponse::NowPlaying("".to_string()),
-                            uuid,
-                        );
+                    EngineCommand::Play(id) => {
+                        let Some(id) = id else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                if let Some(id) = sequencer.get_playing().await {
+                                    EngineResponse::NowPlaying(id)
+                                } else {
+                                    EngineResponse::NowPaused
+                                },
+                                Uuid::nil(),
+                            );
+
+                            continue;
+                        };
+
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender
+                                .send((EngineResponse::Nope(EngineCommand::Play(Some(id))), uuid));
+
+                            continue;
+                        }
+
+                        if sequencer.play(id.clone()).await.is_ok() {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                if let Some(id) = sequencer.get_playing().await {
+                                    EngineResponse::NowPlaying(id)
+                                } else {
+                                    EngineResponse::NowPaused
+                                },
+                                Uuid::nil(),
+                            );
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Queue(sequencer.get_queue().await),
+                                Uuid::nil(),
+                            );
+                        } else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::Play(Some(id))),
+                                uuid,
+                            );
+                        }
                     }
                     EngineCommand::Pause => {
-                        // TODO: Pause the song if there is one, otherwise "Nope"
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender.send((EngineResponse::Nope(command), uuid));
+
+                            continue;
+                        }
+
+                        sequencer.pause().await;
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::NowPaused("".to_string()),
-                            uuid,
+                            if let Some(id) = sequencer.get_playing().await {
+                                EngineResponse::NowPlaying(id)
+                            } else {
+                                EngineResponse::NowPaused
+                            },
+                            Uuid::nil(),
                         );
                     }
                     EngineCommand::Next => {
-                        // TODO: Play the next song in the queue if there is one and send the new queue, otherwise "Nope"
-                        route_response(
-                            local,
-                            &local_response_sender,
-                            &response_sender,
-                            EngineResponse::NowPlaying("".to_string()),
-                            uuid,
-                        );
-                        route_response(
-                            local,
-                            &local_response_sender,
-                            &response_sender,
-                            EngineResponse::Queue(Vec::new()),
-                            uuid,
-                        );
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender.send((EngineResponse::Nope(command), uuid));
+
+                            continue;
+                        }
+
+                        if sequencer.next().await.is_ok() {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                if let Some(id) = sequencer.get_playing().await {
+                                    EngineResponse::NowPlaying(id)
+                                } else {
+                                    EngineResponse::NowPaused
+                                },
+                                Uuid::nil(),
+                            );
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Queue(sequencer.get_queue().await),
+                                Uuid::nil(),
+                            );
+                        } else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::Next),
+                                uuid,
+                            );
+                        }
                     }
                     EngineCommand::Previous => {
-                        // TODO: Play the previous song in the queue if there is one and send the new queue, otherwise "Nope"
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender.send((EngineResponse::Nope(command), uuid));
+
+                            continue;
+                        }
+
+                        if sequencer.previous().await.is_ok() {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                if let Some(id) = sequencer.get_playing().await {
+                                    EngineResponse::NowPlaying(id)
+                                } else {
+                                    EngineResponse::NowPaused
+                                },
+                                Uuid::nil(),
+                            );
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Queue(sequencer.get_queue().await),
+                                Uuid::nil(),
+                            );
+                        } else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::Previous),
+                                uuid,
+                            );
+                        }
+                    }
+                    EngineCommand::Seek(position) => {
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender.send((EngineResponse::Nope(command), uuid));
+
+                            continue;
+                        }
+
+                        if sequencer.seek(position).await.is_ok() {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Seek(Duration::from_secs(0)),
+                                Uuid::nil(),
+                            );
+                        } else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::Seek(position)),
+                                uuid,
+                            );
+                        }
+                    }
+                    EngineCommand::Queue(recording_ids) => {
+                        let Some(recording_ids) = recording_ids else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Queue(sequencer.get_queue().await),
+                                Uuid::nil(),
+                            );
+
+                            continue;
+                        };
+
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Queue)
+                        {
+                            let _ = response_sender.send((
+                                EngineResponse::Nope(EngineCommand::Queue(Some(recording_ids))),
+                                uuid,
+                            ));
+
+                            continue;
+                        }
+
+                        let Ok(not_queued) = sequencer.add_queue(recording_ids.clone()).await
+                        else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::Queue(Some(recording_ids))),
+                                Uuid::nil(),
+                            );
+
+                            continue;
+                        };
+
+                        if not_queued.len() != 0 {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::Queue(Some(not_queued))),
+                                uuid,
+                            );
+                        }
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::NowPlaying("".to_string()),
-                            uuid,
-                        );
-                        route_response(
-                            local,
-                            &local_response_sender,
-                            &response_sender,
-                            EngineResponse::Queue(Vec::new()),
-                            uuid,
+                            EngineResponse::Queue(sequencer.get_queue().await),
+                            Uuid::nil(),
                         );
                     }
-                    EngineCommand::Seek(_) => {
-                        // TODO: Seek to a point in the song if there is one, otherwise "Nope"
+                    EngineCommand::ShuffleQueue(enable) => {
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender.send((EngineResponse::Nope(command), uuid));
+
+                            continue;
+                        }
+
+                        sequencer.set_shuffle(enable).await;
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::Seek(Duration::from_secs(0)),
-                            uuid,
-                        );
-                    }
-                    EngineCommand::Queue(_) => {
-                        // TODO: Add a set of songs to the queue (if songs are missing, a nope will be sent with the missing songs), otherwise get the queue
-                        route_response(
-                            local,
-                            &local_response_sender,
-                            &response_sender,
-                            EngineResponse::Queue(Vec::new()),
-                            uuid,
-                        );
-                    }
-                    EngineCommand::ShuffleQueue(_) => {
-                        // TODO: Enable or disable shuffling of the queue
-                        route_response(
-                            local,
-                            &local_response_sender,
-                            &response_sender,
-                            EngineResponse::Queue(Vec::new()),
-                            uuid,
+                            EngineResponse::Queue(sequencer.get_queue().await),
+                            Uuid::nil(),
                         );
                     }
                     EngineCommand::ClearQueue => {
-                        // TODO: Clear the queue
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Queue)
+                        {
+                            let _ = response_sender.send((EngineResponse::Nope(command), uuid));
+
+                            continue;
+                        }
+
+                        sequencer.clear_queue().await;
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
                             EngineResponse::Queue(Vec::new()),
-                            uuid,
+                            Uuid::nil(),
                         );
                     }
                     EngineCommand::LoopMode(loop_mode) => {
-                        // TODO: Set the loop mode
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Control)
+                        {
+                            let _ = response_sender.send((
+                                EngineResponse::Nope(EngineCommand::LoopMode(loop_mode)),
+                                uuid,
+                            ));
+
+                            continue;
+                        }
+
+                        sequencer.set_loop_mode(loop_mode.clone()).await;
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
                             EngineResponse::LoopMode(loop_mode),
-                            uuid,
+                            Uuid::nil(),
                         );
                     }
-                    EngineCommand::SongMetadata(_) => {
-                        // TODO: Get the Song Metadata, otherwise "Nope"
+                    EngineCommand::RecordingMetadata(id) => {
+                        let Ok(recording_metadata) =
+                            database.get_recording_metadata(id.clone()).await
+                        else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::RecordingMetadata(id)),
+                                uuid,
+                            );
+                            continue;
+                        };
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::SongMetadata(SongMetadata {}),
+                            EngineResponse::RecordingMetadata(recording_metadata),
                             uuid,
                         );
                     }
-                    EngineCommand::SongFile(_) => {
-                        // TODO: Get the Song File, otherwise "Nope"
+                    EngineCommand::RecordingFile(id) => {
+                        let Ok(mut recording_file) = database.get_recording_file(id.clone()).await
+                        else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::RecordingFile(id)),
+                                uuid,
+                            );
+                            continue;
+                        };
+
+                        let mut buffer = Vec::new();
+                        let _ = recording_file.read_to_end(&mut buffer);
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::SongFile(("".to_string(), Vec::new())),
+                            EngineResponse::RecordingFile((id, buffer)),
                             uuid,
                         );
                     }
-                    EngineCommand::SendSong(_) => {
-                        // TODO: Receive the song and database it if user has permissions, otherwise "Nope"
+                    EngineCommand::SendRecording((id, recording)) => {
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Transfer)
+                        {
+                            let _ = response_sender.send((
+                                EngineResponse::Nope(EngineCommand::SendRecording((id, recording))),
+                                uuid,
+                            ));
+
+                            continue;
+                        }
+
+                        database
+                            .set_recording_file(id.clone(), Some(recording.clone()))
+                            .await;
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::Ok(command),
+                            EngineResponse::Ok(EngineCommand::SendRecording((id, recording))),
                             uuid,
                         );
                     }
-                    EngineCommand::PlaylistMetadata(_) => {
-                        // TODO: Get the Song Metadata, otherwise "Nope"
+                    EngineCommand::PlaylistMetadata(id) => {
+                        let Ok(playlist_metadata) = database.get_playlist(id.clone()).await else {
+                            route_response(
+                                internal,
+                                &internal_response_sender,
+                                &response_sender,
+                                EngineResponse::Nope(EngineCommand::PlaylistMetadata(id)),
+                                uuid,
+                            );
+                            continue;
+                        };
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::PlaylistMetadata(PlaylistMetadata {}),
+                            EngineResponse::PlaylistMetadata(playlist_metadata),
                             uuid,
                         );
                     }
-                    EngineCommand::SetPlaylistMetadata(_) => {
-                        // TODO: Set the Playlist Metadata if user has permissions (or is local), otherwise "Nope"
+                    EngineCommand::SetPlaylistMetadata(metadata) => {
+                        if !internal
+                            && !permission_exists(&current_user_permissions, Permission::Playlist)
+                        {
+                            let _ = response_sender.send((
+                                EngineResponse::Nope(EngineCommand::SetPlaylistMetadata(metadata)),
+                                uuid,
+                            ));
+
+                            continue;
+                        }
+
+                        database.set_playlist(metadata.clone()).await;
+
                         route_response(
-                            local,
-                            &local_response_sender,
+                            internal,
+                            &internal_response_sender,
                             &response_sender,
-                            EngineResponse::Ok(command),
-                            uuid,
+                            EngineResponse::PlaylistMetadata(metadata),
+                            Uuid::nil(),
                         );
                     }
-                    EngineCommand::SetVolume(_) => {
-                        if local {
-                            // TODO: Set volume (ignore this if this was meant for another device)
+                    EngineCommand::SetVolume(volume) => {
+                        if internal {
+                            let _ = sequencer.set_volume(volume).await;
                         }
                     }
                     EngineCommand::GetPermissions => {
-                        // TODO: Get the user's permissions
-                        if local {
-                            route_response(
-                                local,
-                                &local_response_sender,
-                                &response_sender,
-                                EngineResponse::Permissions(Vec::new()),
-                                uuid,
-                            );
-
-                            let _ = local_response_sender.send(EngineResponse::Permissions(vec![
-                                Permission::Control,
-                                Permission::Queue,
-                                Permission::Playlist,
-                                Permission::Transfer,
-                            ]));
+                        if internal {
+                            let _ =
+                                internal_response_sender.send(EngineResponse::Permissions(vec![
+                                    Permission::Control,
+                                    Permission::Queue,
+                                    Permission::Playlist,
+                                    Permission::Transfer,
+                                ]));
                         } else {
                             let _ = response_sender
                                 .send((EngineResponse::Permissions(Vec::new()), uuid));
                         }
                     }
-                    EngineCommand::SetPermissions(_) => {
-                        if !local {
+                    EngineCommand::SetPermissions(ref new_permissions) => {
+                        if internal {
+                            current_user_permissions = new_permissions.to_vec();
+
+                            let _ = internal_response_sender.send(EngineResponse::Permissions(
+                                current_user_permissions.clone(),
+                            ));
+                        } else {
                             let _ = response_sender.send((EngineResponse::Nope(command), uuid));
                         }
                     }
@@ -417,20 +665,63 @@ impl Engine {
         let mut command_receiver = self.engine_command_sender.subscribe();
         let response_sender = self.engine_response_sender.clone();
 
+        let database = self.database.clone();
+        let sequencer = self.sequencer.clone();
+
         tokio::spawn(async move {
+            let mut remote_device_permissions = Vec::<Permission>::new();
+
             loop {
                 tokio::select! {
-                    resp = response_receiver.recv() => if let Some(resp) = resp {
-                        let _ = response_sender.send(resp);
+                    response = response_receiver.recv() => if let Some(response) = response {
+                        match response {
+                            EngineResponse::RecordingMetadata(recording_metadata) => {
+                                if permission_exists(&remote_device_permissions, Permission::Transfer) {
+                                    let _ = database.get_recording_metadata(recording_metadata.recording.id.clone());
+                                }
+
+                                let _ = response_sender.send(EngineResponse::RecordingMetadata(recording_metadata));
+                            },
+                            EngineResponse::RecordingFile((id, data)) => {
+                                if permission_exists(&remote_device_permissions, Permission::Transfer) {
+                                    database.set_recording_file(id.clone(), Some(data.clone())).await;
+                                }
+
+                                let _ = response_sender.send(EngineResponse::RecordingFile((id, data)));
+                            },
+                            EngineResponse::PlaylistMetadata(playlist_metadata) => {
+                                if permission_exists(&remote_device_permissions, Permission::Playlist) {
+                                    database.set_playlist(playlist_metadata.clone()).await;
+                                }
+
+                                let _ = response_sender.send(EngineResponse::PlaylistMetadata(playlist_metadata));
+                            },
+                            x => {
+                                let _ = response_sender.send(x);
+                            }
+                        }
                     },
-                    cmd = command_receiver.recv() => if let Ok(cmd) = cmd {
-                        if matches!(
-                            cmd,
-                            EngineCommand::SetVolume(_)
-                        ) {
-                            // TODO: Set volume (this shouldn't be sent to the remote device)
-                        } else {
-                            let _ = command_sender.send(cmd);
+                    command = command_receiver.recv() => if let Ok(command) = command {
+                        match command {
+                            EngineCommand::SendRecording((id, data)) => {
+                                database.set_recording_file(id.clone(), Some(data.clone())).await;
+
+                                let _ = command_sender.send(EngineCommand::SendRecording((id, data)));
+                            },
+                            EngineCommand::SetPlaylistMetadata(playlist_metadata) => {
+                                database.set_playlist(playlist_metadata.clone()).await;
+
+                                let _ = command_sender.send(EngineCommand::SetPlaylistMetadata(playlist_metadata));
+                            },
+                            EngineCommand::SetVolume(volume) => {
+                                let _ = sequencer.set_volume(volume).await;
+                            },
+                            EngineCommand::SetPermissions(ref new_permissions) => {
+                                remote_device_permissions = new_permissions.to_vec();
+                            }
+                            x => {
+                                let _ = command_sender.send(x);
+                            }
                         }
                     }
                 }
@@ -576,15 +867,26 @@ impl Engine {
 }
 
 fn route_response(
-    local: bool,
-    local_sender: &broadcast::Sender<EngineResponse>,
+    internal: bool,
+    internal_sender: &broadcast::Sender<EngineResponse>,
     remote_sender: &broadcast::Sender<(EngineResponse, Uuid)>,
     response: EngineResponse,
     uuid: Uuid,
 ) {
-    if local {
-        let _ = local_sender.send(response);
+    if internal {
+        let _ = internal_sender.send(response);
+    } else if uuid == Uuid::nil() {
+        let _ = internal_sender.send(response.clone());
+        let _ = remote_sender.send((response, uuid));
     } else {
         let _ = remote_sender.send((response, uuid));
     };
+}
+
+fn permission_exists(permission_array: &Vec<Permission>, permission: Permission) -> bool {
+    if permission_array.iter().any(|e| *e == permission) {
+        true
+    } else {
+        false
+    }
 }

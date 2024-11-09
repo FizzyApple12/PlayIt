@@ -13,8 +13,8 @@ pub enum IPCClientError {
 }
 
 pub struct IPCClient {
-    commection_reader: JoinHandle<()>,
-    commection_writer: JoinHandle<()>,
+    connection_reader: JoinHandle<()>,
+    connection_writer: JoinHandle<()>,
     internal_command_sender: mpsc::Sender<EngineCommand>,
 }
 
@@ -44,7 +44,7 @@ impl IPCClient {
 
         let (receiver, sender) = stream.split();
 
-        let commection_reader = tokio::spawn(async move {
+        let connection_reader = tokio::spawn(async move {
             let mut receiver = BufReader::new(receiver);
 
             loop {
@@ -68,7 +68,7 @@ impl IPCClient {
             }
         });
 
-        let commection_writer = tokio::spawn(async move {
+        let connection_writer = tokio::spawn(async move {
             let mut sender = BufWriter::new(sender);
 
             loop {
@@ -76,20 +76,22 @@ impl IPCClient {
                     continue;
                 };
 
-                let Ok(message): Result<String, serde_json::Error> =
-                    serde_json::to_string(&command)
+                let Ok(mut message): Result<Vec<u8>, serde_json::Error> =
+                    serde_json::to_vec(&command)
                 else {
                     continue;
                 };
 
-                let _ = sender.write_all(message.as_bytes());
+                message.push(b'\n');
+
+                let _ = sender.write_all(&*message);
             }
         });
 
         Ok((
             IPCClient {
-                commection_reader,
-                commection_writer,
+                connection_reader,
+                connection_writer,
                 internal_command_sender,
             },
             response_receiver,
@@ -102,7 +104,7 @@ impl Drop for IPCClient {
     fn drop(&mut self) {
         let _ = self.internal_command_sender.send(EngineCommand::Goodbye);
 
-        self.commection_reader.abort();
-        self.commection_writer.abort();
+        self.connection_reader.abort();
+        self.connection_writer.abort();
     }
 }
